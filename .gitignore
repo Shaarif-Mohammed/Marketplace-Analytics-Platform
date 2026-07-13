@@ -1,0 +1,59 @@
+# ===== Data =====
+# Raw Olist CSVs are large and not ours to redistribute (Kaggle license) —
+# document the source instead in docs/data_provenance.md and keep data out of git.
+data/*
+!data/.gitkeep
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual / conda environments
+venv/
+env/
+.venv/
+.conda/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== Environment / secrets =====
+.env
+.env.*
+*.pem
+config.ini
+secrets.yaml
+
+# ===== PostgreSQL =====
+*.sql.bak
+*.dump
+*.backup
+pgdata/
+
+# ===== Tableau =====
+# Keep .twbx (packaged workbook) but ignore temp/local-only Tableau files
+*.twb
+*.tde
+*.hyper
+*.tableau-prep
+
+# ===== OS junk =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Editor/IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ===== Logs =====
+*.log
+logs/
