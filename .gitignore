@@ -1,8 +1,10 @@
 # ===== Data =====
 # Raw Olist CSVs are large and not ours to redistribute (Kaggle license) —
-# document the source instead in docs/data_provenance.md and keep data out of git.
-data/*
-!data/.gitkeep
+# document the source and keep the CSV's out of git.
+# Scripts in data folder will be used to download the data locally.
+
+data/*.csv
+data/*.zip
 
 # ===== Python =====
 __pycache__/
