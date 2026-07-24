@@ -1,4 +1,4 @@
-# ETL Decisions
+# ETL Methodology
 ## Marketplace Analytics Platform
 
 ## Overview
