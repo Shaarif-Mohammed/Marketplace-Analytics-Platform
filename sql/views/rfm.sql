@@ -21,7 +21,9 @@
 --   About to Sleep   : R <= 2, F <= 2
 --   At Risk          : R <= 2, F >= 3
 --   Cannot Lose Them : R = 1, F >= 4
---   Lost             : R = 1, F <= 2
+--  (9 segments total — the CASE ELSE covers every remaining R/F combination
+--   as 'Uncategorised', but since scores are always 1-5 across 9 named
+--   conditions, this branch is a defensive fallback and should never fire)
 -- =============================================================================
 
 CREATE OR REPLACE VIEW warehouse.vw_rfm AS
@@ -112,7 +114,7 @@ rfm_segments AS (
             WHEN r_score >= 3 AND f_score <= 2                  THEN 'Promising'
             WHEN r_score <= 2 AND f_score >= 3                  THEN 'At Risk'
             WHEN r_score <= 2 AND f_score <= 2                  THEN 'About to Sleep'
-            ELSE                                                      'Lost'
+            ELSE                                                      'Uncategorised'
         END AS segment
     FROM rfm_scores
 )
