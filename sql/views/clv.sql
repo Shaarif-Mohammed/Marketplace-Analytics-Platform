@@ -120,7 +120,7 @@ clv_projected AS (
 clv_tiered AS (
     SELECT
         *,
-        CASE NTILE(3) OVER (ORDER BY projected_clv_12m ASC)
+        CASE NTILE(3) OVER (ORDER BY projected_clv_12m ASC, customer_unique_id ASC)
             WHEN 3 THEN 'High'
             WHEN 2 THEN 'Mid'
             WHEN 1 THEN 'Low'

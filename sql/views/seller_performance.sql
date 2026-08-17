@@ -218,7 +218,7 @@ revenue_ranked AS (
     SELECT
         *,
         ROUND(
-            (NTILE(100) OVER (ORDER BY total_revenue ASC))::NUMERIC
+            (NTILE(100) OVER (ORDER BY total_revenue ASC, seller_id ASC))::NUMERIC
         , 2) AS revenue_percentile
     FROM combined
 ),

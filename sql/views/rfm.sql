@@ -85,11 +85,11 @@ rfm_scores AS (
         first_order_date,
         last_order_date,
         -- Recency: inverted so 5 = most recent
-        6 - NTILE(5) OVER (ORDER BY days_since_last_order ASC)  AS r_score,
+        6 - NTILE(5) OVER (ORDER BY days_since_last_order ASC, customer_unique_id ASC)  AS r_score,
         -- Frequency: 5 = most frequent
-        NTILE(5) OVER (ORDER BY order_count ASC)                AS f_score,
+        NTILE(5) OVER (ORDER BY order_count ASC, customer_unique_id ASC)                AS f_score,
         -- Monetary: 5 = highest spend
-        NTILE(5) OVER (ORDER BY total_spend ASC)                AS m_score
+        NTILE(5) OVER (ORDER BY total_spend ASC, customer_unique_id ASC)                AS m_score
     FROM customer_metrics
 ),
 
