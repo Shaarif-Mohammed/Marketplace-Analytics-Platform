@@ -14,8 +14,12 @@
 --
 -- Metrics:
 --   Volume        : order count, transaction count, revenue share
+--                   (all orders — payment is recorded regardless of delivery)
 --   Value         : avg order value, avg payment value, total revenue
---   Instalments   : avg instalments, % single vs multi-instalment
+--                   (DELIVERED ORDERS ONLY — see AUDIT FIX)
+--   Instalments   : avg instalments, % single vs multi-instalment (all orders
+--                   — instalment choice is valid behavioral data regardless
+--                   of whether the order was later delivered)
 --   Behaviour     : high-value order threshold (above/below median AOV)
 --
 -- Notes:
@@ -25,13 +29,23 @@
 --     to avoid double counting — payment_value used for payment analysis.
 --   • payment_installments = 0 was fixed to 1 in ETL (2 rows affected)
 --   • Delivered orders only for revenue metrics; all orders for payment
---     type distribution (payment is recorded regardless of delivery)
+--     type distribution (payment is recorded regardless of delivery).
+
 -- =============================================================================
 
 CREATE OR REPLACE VIEW warehouse.vw_payment_behaviour AS
 
 WITH
--- ── Step 1: Join payments to orders ───────────────────────────────────────────
+-- ── Step 1: Order-level item totals (no fan-out — one row per order) ────────
+order_level_items AS (
+    SELECT
+        order_id,
+        SUM(price + freight_value) AS order_item_total
+    FROM warehouse.fact_order_items
+    GROUP BY order_id
+),
+
+-- ── Step 2: Join payments to orders (no item join here — avoids fan-out) ────
 payments_with_orders AS (
     SELECT
         fp.order_id,
@@ -41,20 +55,17 @@ payments_with_orders AS (
         fp.payment_value,
         o.order_status,
         o.order_purchase_timestamp,
-        -- Total order value from items (for delivered orders)
-        SUM(i.price + i.freight_value) OVER (
-            PARTITION BY fp.order_id
-        )                                               AS order_item_total
+        oli.order_item_total
     FROM warehouse.fact_payments fp
     LEFT JOIN warehouse.dim_order o
         ON fp.order_id = o.order_id
-    LEFT JOIN warehouse.fact_order_items i
-        ON fp.order_id = i.order_id
+    LEFT JOIN order_level_items oli
+        ON fp.order_id = oli.order_id
 ),
 
--- ── Step 2: Deduplicate to primary payment per order ──────────────────────────
--- For orders with multiple payment methods, use the first sequential payment
--- as the primary type (payment_sequential = 1)
+-- ── Step 3: Deduplicate to primary payment per order ──────────────────────────
+-- Each order's LOWEST available sequential payment is treated as primary —
+-- not hardcoded to exactly 1, since some orders' sequences start higher.
 primary_payments AS (
     SELECT DISTINCT ON (order_id)
         order_id,
@@ -65,11 +76,10 @@ primary_payments AS (
         order_purchase_timestamp,
         order_item_total
     FROM payments_with_orders
-    WHERE payment_sequential = 1
-    ORDER BY order_id, payment_sequential
+    ORDER BY order_id, payment_sequential ASC
 ),
 
--- ── Step 3: Instalment band classification ────────────────────────────────────
+-- ── Step 4: Instalment band classification ────────────────────────────────────
 payments_banded AS (
     SELECT
         *,
@@ -88,16 +98,19 @@ payments_banded AS (
     FROM primary_payments
 ),
 
--- ── Step 4a: Summary by payment type ─────────────────────────────────────────
+-- ── Step 5a: Summary by payment type ─────────────────────────────────────────
 by_payment_type AS (
     SELECT
         'By Payment Type'                               AS dimension,
         payment_type                                    AS dimension_value,
         NULL::TEXT                                      AS sub_dimension,
         COUNT(order_id)                                 AS order_count,
-        ROUND(SUM(payment_value)::NUMERIC, 2)           AS total_payment_value,
-        ROUND(AVG(payment_value)::NUMERIC, 2)           AS avg_payment_value,
-        ROUND(AVG(order_item_total)::NUMERIC, 2)        AS avg_order_item_total,
+        ROUND(SUM(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS total_payment_value,
+        ROUND(AVG(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS avg_payment_value,
+        ROUND(AVG(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS avg_order_item_total,
         ROUND(AVG(payment_installments)::NUMERIC, 2)    AS avg_instalments,
         SUM(CASE WHEN payment_installments = 1
             THEN 1 ELSE 0 END)                          AS single_instalment_orders,
@@ -115,22 +128,26 @@ by_payment_type AS (
             COUNT(order_id) * 100.0 / SUM(COUNT(order_id)) OVER ()
         , 2)                                            AS pct_of_orders,
         ROUND(
-            SUM(payment_value) * 100.0 / SUM(SUM(payment_value)) OVER ()
+            SUM(CASE WHEN order_status = 'delivered' THEN order_item_total END) * 100.0
+            / SUM(SUM(CASE WHEN order_status = 'delivered' THEN order_item_total END)) OVER ()
         , 2)                                            AS pct_of_revenue
     FROM payments_banded
     GROUP BY payment_type
 ),
 
--- ── Step 4b: Summary by instalment band ───────────────────────────────────────
+-- ── Step 5b: Summary by instalment band ───────────────────────────────────────
 by_instalment_band AS (
     SELECT
         'By Instalment Band'                            AS dimension,
         instalment_band                                 AS dimension_value,
         NULL::TEXT                                      AS sub_dimension,
         COUNT(order_id)                                 AS order_count,
-        ROUND(SUM(payment_value)::NUMERIC, 2)           AS total_payment_value,
-        ROUND(AVG(payment_value)::NUMERIC, 2)           AS avg_payment_value,
-        ROUND(AVG(order_item_total)::NUMERIC, 2)        AS avg_order_item_total,
+        ROUND(SUM(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS total_payment_value,
+        ROUND(AVG(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS avg_payment_value,
+        ROUND(AVG(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS avg_order_item_total,
         ROUND(AVG(payment_installments)::NUMERIC, 2)    AS avg_instalments,
         SUM(CASE WHEN payment_installments = 1
             THEN 1 ELSE 0 END)                          AS single_instalment_orders,
@@ -148,22 +165,26 @@ by_instalment_band AS (
             COUNT(order_id) * 100.0 / SUM(COUNT(order_id)) OVER ()
         , 2)                                            AS pct_of_orders,
         ROUND(
-            SUM(payment_value) * 100.0 / SUM(SUM(payment_value)) OVER ()
+            SUM(CASE WHEN order_status = 'delivered' THEN order_item_total END) * 100.0
+            / SUM(SUM(CASE WHEN order_status = 'delivered' THEN order_item_total END)) OVER ()
         , 2)                                            AS pct_of_revenue
     FROM payments_banded
     GROUP BY instalment_band
 ),
 
--- ── Step 4c: Cross — payment type × instalment band ───────────────────────────
+-- ── Step 5c: Cross — payment type × instalment band ───────────────────────────
 cross_analysis AS (
     SELECT
         'Cross'                                         AS dimension,
         payment_type                                    AS dimension_value,
         instalment_band                                 AS sub_dimension,
         COUNT(order_id)                                 AS order_count,
-        ROUND(SUM(payment_value)::NUMERIC, 2)           AS total_payment_value,
-        ROUND(AVG(payment_value)::NUMERIC, 2)           AS avg_payment_value,
-        ROUND(AVG(order_item_total)::NUMERIC, 2)        AS avg_order_item_total,
+        ROUND(SUM(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS total_payment_value,
+        ROUND(AVG(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS avg_payment_value,
+        ROUND(AVG(CASE WHEN order_status = 'delivered'
+            THEN order_item_total END)::NUMERIC, 2)     AS avg_order_item_total,
         ROUND(AVG(payment_installments)::NUMERIC, 2)    AS avg_instalments,
         SUM(CASE WHEN payment_installments = 1
             THEN 1 ELSE 0 END)                          AS single_instalment_orders,
@@ -181,7 +202,8 @@ cross_analysis AS (
             COUNT(order_id) * 100.0 / SUM(COUNT(order_id)) OVER ()
         , 2)                                            AS pct_of_orders,
         ROUND(
-            SUM(payment_value) * 100.0 / SUM(SUM(payment_value)) OVER ()
+            SUM(CASE WHEN order_status = 'delivered' THEN order_item_total END) * 100.0
+            / SUM(SUM(CASE WHEN order_status = 'delivered' THEN order_item_total END)) OVER ()
         , 2)                                            AS pct_of_revenue
     FROM payments_banded
     GROUP BY payment_type, instalment_band

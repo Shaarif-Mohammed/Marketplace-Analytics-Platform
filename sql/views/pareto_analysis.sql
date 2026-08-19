@@ -12,10 +12,13 @@
 --
 -- Metrics per entity:
 --   total_revenue         : lifetime revenue from delivered orders
---   revenue_rank          : ranked 1 = highest revenue
+--   revenue_rank          : ranked 1 = highest revenue (ties share a rank —
+--                            correct for a "this is the Nth highest" display)
 --   revenue_pct_of_total  : this entity's share of total revenue
 --   cumulative_revenue_pct: running total — used to identify 80/20 threshold
 --   cumulative_pct_of_entities: what % of entities have been counted so far
+--                            (strictly increasing per entity, even within a
+--                            revenue tie — see AUDIT FIX below)
 --
 -- Usage in Tableau:
 --   Filter entity_type = 'Customer' or 'Seller' separately.
@@ -90,7 +93,7 @@ ranked AS (
         c.total_orders,
         et.grand_total_revenue,
         et.total_entities,
-        -- Rank 1 = highest revenue
+        -- Rank 1 = highest revenue (ties share a rank — correct for display)
         RANK() OVER (
             PARTITION BY c.entity_type
             ORDER BY c.total_revenue DESC
@@ -107,9 +110,11 @@ ranked AS (
                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
             ) * 100.0 / et.grand_total_revenue
         , 2)                                            AS cumulative_revenue_pct,
-        -- What % of all entities have been counted so far
+        -- What % of all entities have been counted so far — ROW_NUMBER, not
+        -- RANK, so ties still get a distinct, incrementing position (see
+        -- AUDIT FIX note above)
         ROUND(
-            RANK() OVER (
+            ROW_NUMBER() OVER (
                 PARTITION BY c.entity_type
                 ORDER BY c.total_revenue DESC
             ) * 100.0 / et.total_entities
