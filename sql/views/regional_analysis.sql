@@ -25,47 +25,70 @@
 CREATE OR REPLACE VIEW warehouse.vw_regional_analysis AS
 
 WITH
--- ── Demand side: customer state metrics ───────────────────────────────────────
-customer_state_metrics AS (
+
+-- ── Demand side: order-level base (items collapsed to order grain first) ────
+order_level AS (
     SELECT
         c.customer_state,
-        COUNT(DISTINCT c.customer_unique_id)            AS unique_customers,
-        COUNT(DISTINCT o.order_id)                      AS total_orders,
-        ROUND(SUM(i.price + i.freight_value)::NUMERIC, 2)  AS total_revenue,
-        ROUND(AVG(i.price + i.freight_value)::NUMERIC, 2)  AS avg_order_value,
-        ROUND(SUM(i.price)::NUMERIC, 2)                 AS total_product_revenue,
-        ROUND(SUM(i.freight_value)::NUMERIC, 2)         AS total_freight_revenue,
-        -- Average delivery time by customer state
-        ROUND(AVG(
-            CASE
-                WHEN o.order_delivered_customer_date IS NOT NULL
-                THEN DATE_PART('day',
-                    o.order_delivered_customer_date - o.order_purchase_timestamp
-                )
-            END
-        )::NUMERIC, 1)                                  AS avg_delivery_days,
-        -- On-time delivery rate by customer state
-        ROUND(
-            SUM(CASE
-                WHEN o.order_delivered_customer_date <= o.order_estimated_delivery_date
-                THEN 1 ELSE 0
-            END) * 100.0
-            / NULLIF(COUNT(CASE
-                WHEN o.order_delivered_customer_date IS NOT NULL
-                AND o.order_estimated_delivery_date IS NOT NULL
-                THEN 1 END), 0)
-        , 2)                                            AS on_time_rate,
-        -- Average review score by customer state
-        ROUND(AVG(r.review_score)::NUMERIC, 2)          AS avg_review_score
+        o.order_id,
+        c.customer_unique_id,
+        o.order_delivered_customer_date,
+        o.order_purchase_timestamp,
+        o.order_estimated_delivery_date,
+        SUM(i.price)                       AS order_product_revenue,
+        SUM(i.freight_value)               AS order_freight_revenue,
+        SUM(i.price + i.freight_value)     AS order_total
     FROM warehouse.dim_customer c
     JOIN warehouse.dim_order o
         ON c.customer_key = o.customer_key
     JOIN warehouse.fact_order_items i
         ON o.order_id = i.order_id
-    LEFT JOIN warehouse.fact_reviews r
-        ON o.order_id = r.order_id
     WHERE o.order_status = 'delivered'
-    GROUP BY c.customer_state
+    GROUP BY c.customer_state, o.order_id, c.customer_unique_id,
+             o.order_delivered_customer_date, o.order_purchase_timestamp,
+             o.order_estimated_delivery_date
+),
+
+-- ── Reviews deduplicated to order grain before joining (prevents fan-out) ───
+review_by_order AS (
+    SELECT order_id, AVG(review_score) AS order_review_score
+    FROM warehouse.fact_reviews
+    GROUP BY order_id
+),
+
+-- ── Demand side: customer state metrics (order grain, no fan-out) ───────────
+customer_state_metrics AS (
+    SELECT
+        ol.customer_state,
+        COUNT(DISTINCT ol.customer_unique_id)           AS unique_customers,
+        COUNT(DISTINCT ol.order_id)                     AS total_orders,
+        ROUND(SUM(ol.order_total)::NUMERIC, 2)          AS total_revenue,
+        ROUND(AVG(ol.order_total)::NUMERIC, 2)          AS avg_order_value,
+        ROUND(SUM(ol.order_product_revenue)::NUMERIC, 2) AS total_product_revenue,
+        ROUND(SUM(ol.order_freight_revenue)::NUMERIC, 2) AS total_freight_revenue,
+        ROUND(AVG(
+            CASE
+                WHEN ol.order_delivered_customer_date IS NOT NULL
+                THEN DATE_PART('day',
+                    ol.order_delivered_customer_date - ol.order_purchase_timestamp
+                )
+            END
+        )::NUMERIC, 1)                                  AS avg_delivery_days,
+        ROUND(
+            SUM(CASE
+                WHEN ol.order_delivered_customer_date <= ol.order_estimated_delivery_date
+                THEN 1 ELSE 0
+            END) * 100.0
+            / NULLIF(COUNT(CASE
+                WHEN ol.order_delivered_customer_date IS NOT NULL
+                AND ol.order_estimated_delivery_date IS NOT NULL
+                THEN 1 END), 0)
+        , 2)                                            AS on_time_rate,
+        ROUND(AVG(rbo.order_review_score)::NUMERIC, 2)  AS avg_review_score
+    FROM order_level ol
+    LEFT JOIN review_by_order rbo
+        ON ol.order_id = rbo.order_id
+    GROUP BY ol.customer_state
 ),
 
 -- ── Supply side: seller state metrics ─────────────────────────────────────────

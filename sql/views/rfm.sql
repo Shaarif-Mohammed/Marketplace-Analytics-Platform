@@ -46,27 +46,34 @@ delivered_orders AS (
     WHERE o.order_status = 'delivered'
 ),
 
--- ── Step 2: Aggregate to customer level ───────────────────────────────────────
+-- ── Step 2: Collapse items to order level (prevents multi-item inflation) ───
+order_level AS (
+    SELECT
+        customer_unique_id,
+        order_id,
+        order_purchase_timestamp,
+        SUM(item_total) AS order_total
+    FROM delivered_orders
+    GROUP BY customer_unique_id, order_id, order_purchase_timestamp
+),
+
+-- ── Step 3: Aggregate to customer level (order grain, not item grain) ───────
 customer_metrics AS (
     SELECT
         customer_unique_id,
-        -- Recency: days between last order and reference date
         DATE_PART('day',
             '2018-09-01'::TIMESTAMP - MAX(order_purchase_timestamp)
         )::INTEGER                          AS days_since_last_order,
-        -- Frequency: number of distinct orders
         COUNT(DISTINCT order_id)            AS order_count,
-        -- Monetary: total spend across all delivered orders
-        ROUND(SUM(item_total)::NUMERIC, 2)  AS total_spend,
-        -- Supporting metrics
-        ROUND(AVG(item_total)::NUMERIC, 2)  AS avg_order_value,
+        ROUND(SUM(order_total)::NUMERIC, 2) AS total_spend,
+        ROUND(AVG(order_total)::NUMERIC, 2) AS avg_order_value,
         MIN(order_purchase_timestamp)::DATE AS first_order_date,
         MAX(order_purchase_timestamp)::DATE AS last_order_date
-    FROM delivered_orders
+    FROM order_level
     GROUP BY customer_unique_id
 ),
 
--- ── Step 3: Score each dimension 1–5 using NTILE ─────────────────────────────
+-- ── Step 4: Score each dimension 1–5 using NTILE ─────────────────────────────
 -- Recency is inverted: fewer days since last order = higher score
 rfm_scores AS (
     SELECT
@@ -86,7 +93,7 @@ rfm_scores AS (
     FROM customer_metrics
 ),
 
--- ── Step 4: Combine scores and assign segment label ───────────────────────────
+-- ── Step 5: Combine scores and assign segment label ───────────────────────────
 rfm_segments AS (
     SELECT
         customer_unique_id,

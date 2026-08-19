@@ -46,13 +46,24 @@ delivered_orders AS (
     WHERE o.order_status = 'delivered'
 ),
 
--- ── Step 2: Customer-level aggregation ───────────────────────────────────────
+-- ── Step 2: Collapse items to order level (prevents multi-item inflation) ───
+order_level AS (
+    SELECT
+        customer_unique_id,
+        order_id,
+        order_purchase_timestamp,
+        SUM(item_total) AS order_total
+    FROM delivered_orders
+    GROUP BY customer_unique_id, order_id, order_purchase_timestamp
+),
+
+-- ── Step 3: Customer-level aggregation (order grain, not item grain) ────────
 customer_metrics AS (
     SELECT
         customer_unique_id,
         COUNT(DISTINCT order_id)                AS order_count,
-        ROUND(SUM(item_total)::NUMERIC, 2)      AS historical_clv,
-        ROUND(AVG(item_total)::NUMERIC, 2)      AS avg_order_value,
+        ROUND(SUM(order_total)::NUMERIC, 2)     AS historical_clv,
+        ROUND(AVG(order_total)::NUMERIC, 2)     AS avg_order_value,
         MIN(order_purchase_timestamp)::DATE     AS first_order_date,
         MAX(order_purchase_timestamp)::DATE     AS last_order_date,
         DATE_PART('day',
@@ -61,11 +72,11 @@ customer_metrics AS (
         DATE_PART('day',
             '2018-09-01'::TIMESTAMP - MAX(order_purchase_timestamp)
         )::INTEGER                              AS days_since_last_order
-    FROM delivered_orders
+    FROM order_level
     GROUP BY customer_unique_id
 ),
 
--- ── Step 3: Projected CLV calculation ────────────────────────────────────────
+-- ── Step 4: Projected CLV calculation ────────────────────────────────────────
 clv_projected AS (
     SELECT
         customer_unique_id,
@@ -105,7 +116,7 @@ clv_projected AS (
     FROM customer_metrics
 ),
 
--- ── Step 4: CLV tier using NTILE ─────────────────────────────────────────────
+-- ── Step 5: CLV tier using NTILE ─────────────────────────────────────────────
 clv_tiered AS (
     SELECT
         *,
