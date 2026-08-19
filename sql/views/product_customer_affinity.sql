@@ -10,10 +10,9 @@
 -- Grain: One row per product_category_name_english.
 --
 -- Metrics:
---   Revenue         : total and average order value by category
+--   Revenue         : total revenue and avg item value by category
 --   Volume          : order count, item count, unique customers
---   Customer profile: avg CLV of customers who buy in this category,
---                     repeat purchase rate within category
+--   Customer profile: repeat purchase rate within category
 --   Review          : avg score, % 5-star, % 1-star by category
 --   Geography       : top customer state by order volume
 --   Delivery        : avg delivery days for category orders
@@ -24,9 +23,11 @@
 --   • Revenue = price + freight_value (total customer spend)
 --   • Repeat purchase rate = customers with 2+ orders in the category
 --     / total unique customers in the category
+--
 -- =============================================================================
+DROP VIEW IF EXISTS warehouse.vw_product_customer_affinity;
 
-CREATE OR REPLACE VIEW warehouse.vw_product_customer_affinity AS
+CREATE VIEW warehouse.vw_product_customer_affinity AS
 
 WITH
 -- ── Step 1: Base — delivered order items with category and customer ────────────
@@ -53,7 +54,7 @@ base AS (
     WHERE o.order_status = 'delivered'
 ),
 
--- ── Step 2: Revenue and volume metrics per category ───────────────────────────
+-- ── Step 2: Revenue and volume metrics per category (item grain — correct) ──
 category_revenue AS (
     SELECT
         category,
@@ -68,40 +69,55 @@ category_revenue AS (
         -- Freight as % of total revenue (high = expensive to ship)
         ROUND(
             SUM(freight_value) * 100.0 / NULLIF(SUM(item_revenue), 0)
-        , 2)                                            AS freight_pct_of_revenue,
-        -- Avg delivery days for this category
-        ROUND(AVG(
-            DATE_PART('day',
-                order_delivered_customer_date - order_purchase_timestamp
-            )
-        )::NUMERIC, 1)                                  AS avg_delivery_days
+        , 2)                                            AS freight_pct_of_revenue
     FROM base
     GROUP BY category
 ),
 
--- ── Step 3: Review metrics per category ──────────────────────────────────────
-category_reviews AS (
+-- ── Step 2b: Avg delivery days, deduplicated to (category, order) grain ─────
+-- Prevents multi-item-same-category orders from over-weighting the average.
+category_delivery AS (
     SELECT
-        COALESCE(p.product_category_name_english, 'uncategorised') AS category,
-        ROUND(AVG(r.review_score)::NUMERIC, 2)          AS avg_review_score,
-        COUNT(DISTINCT r.review_id)                     AS total_reviews,
+        category,
+        ROUND(AVG(
+            DATE_PART('day', order_delivered_customer_date - order_purchase_timestamp)
+        )::NUMERIC, 1) AS avg_delivery_days
+    FROM (
+        SELECT DISTINCT category, order_id, order_delivered_customer_date, order_purchase_timestamp
+        FROM base
+    ) deduped
+    GROUP BY category
+),
+
+-- ── Step 3: Review metrics per category (order-deduped, no fan-out) ─────────
+-- Reviews are deduplicated to order grain first, then to (category, order),
+-- so a multi-item order in one category contributes exactly one review
+-- score to that category's average, not one per item.
+category_reviews AS (
+    WITH review_dedup AS (
+        SELECT order_id, AVG(review_score) AS order_review_score
+        FROM warehouse.fact_reviews
+        GROUP BY order_id
+    ),
+    category_order AS (
+        SELECT DISTINCT category, order_id
+        FROM base
+    )
+    SELECT
+        co.category,
+        ROUND(AVG(rd.order_review_score)::NUMERIC, 2) AS avg_review_score,
+        COUNT(DISTINCT rd.order_id) FILTER (WHERE rd.order_review_score IS NOT NULL) AS total_reviews,
         ROUND(
-            SUM(CASE WHEN r.review_score = 5 THEN 1 ELSE 0 END)
-            * 100.0 / COUNT(DISTINCT r.review_id)
-        , 2)                                            AS pct_5_star,
+            SUM(CASE WHEN rd.order_review_score = 5 THEN 1 ELSE 0 END)
+            * 100.0 / NULLIF(COUNT(DISTINCT rd.order_id) FILTER (WHERE rd.order_review_score IS NOT NULL), 0)
+        , 2) AS pct_5_star,
         ROUND(
-            SUM(CASE WHEN r.review_score = 1 THEN 1 ELSE 0 END)
-            * 100.0 / COUNT(DISTINCT r.review_id)
-        , 2)                                            AS pct_1_star
-    FROM warehouse.fact_order_items i
-    JOIN warehouse.dim_product p
-        ON i.product_key = p.product_key
-    JOIN warehouse.fact_reviews r
-        ON i.order_id = r.order_id
-    JOIN warehouse.dim_order o
-        ON i.order_key = o.order_key
-    WHERE o.order_status = 'delivered'
-    GROUP BY COALESCE(p.product_category_name_english, 'uncategorised')
+            SUM(CASE WHEN rd.order_review_score = 1 THEN 1 ELSE 0 END)
+            * 100.0 / NULLIF(COUNT(DISTINCT rd.order_id) FILTER (WHERE rd.order_review_score IS NOT NULL), 0)
+        , 2) AS pct_1_star
+    FROM category_order co
+    LEFT JOIN review_dedup rd ON co.order_id = rd.order_id
+    GROUP BY co.category
 ),
 
 -- ── Step 4: Repeat purchase rate within category ──────────────────────────────
@@ -109,7 +125,7 @@ category_reviews AS (
 category_repeat AS (
     SELECT
         category,
-        COUNT(DISTINCT customer_unique_id)              AS customers_with_repeat,
+        COUNT(DISTINCT customer_unique_id)              AS total_category_customers,
         COUNT(DISTINCT CASE WHEN order_count >= 2
             THEN customer_unique_id END)                AS repeat_customers
     FROM (
@@ -152,7 +168,7 @@ SELECT
     cr.total_product_revenue,
     cr.total_freight_revenue,
     cr.freight_pct_of_revenue,
-    cr.avg_delivery_days,
+    cd.avg_delivery_days,
     -- Revenue share
     ROUND(cr.total_revenue * 100.0 / tr.grand_total, 2) AS revenue_share_pct,
     -- Cumulative revenue share (ranked by revenue)
@@ -168,11 +184,11 @@ SELECT
     rv.pct_5_star,
     rv.pct_1_star,
     -- Repeat purchase within category
-    rep.customers_with_repeat,
+    rep.total_category_customers,
     rep.repeat_customers,
     ROUND(
         rep.repeat_customers * 100.0
-        / NULLIF(rep.customers_with_repeat, 0)
+        / NULLIF(rep.total_category_customers, 0)
     , 2)                                                AS category_repeat_rate_pct,
     -- Top customer state
     ts.top_customer_state,
@@ -188,6 +204,7 @@ SELECT
     END                                                 AS revenue_tier
 FROM category_revenue cr
 CROSS JOIN total_revenue tr
+LEFT JOIN category_delivery cd  ON cr.category = cd.category
 LEFT JOIN category_reviews rv   ON cr.category = rv.category
 LEFT JOIN category_repeat rep   ON cr.category = rep.category
 LEFT JOIN category_top_state ts ON cr.category = ts.category

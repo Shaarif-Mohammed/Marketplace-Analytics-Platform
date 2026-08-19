@@ -31,6 +31,9 @@
 -- Fix note: on_time_rate calculated at ORDER level (not item level) to
 -- prevent inflation from multi-item orders being counted multiple times.
 -- Deduplication done in order_level_delivery CTE before aggregation.
+-- This remains correct and unchanged in this version — verified
+-- independently rather than assumed. See AUDIT FIX below for issues
+-- found elsewhere in the same view that this note didn't cover.
 -- =============================================================================
 
 CREATE OR REPLACE VIEW warehouse.vw_seller_performance AS
@@ -54,6 +57,27 @@ all_items AS (
         ON i.seller_key = s.seller_key
 ),
 
+-- ── Step 1b: True delivered order count per seller (no date filter) ─────────
+true_delivered_orders AS (
+    SELECT
+        seller_id,
+        COUNT(DISTINCT order_id) AS delivered_orders
+    FROM all_items
+    WHERE order_status = 'delivered'
+    GROUP BY seller_id
+),
+
+-- ── Step 1c: Order-level revenue for a correct avg_order_value ──────────────
+order_level_revenue AS (
+    SELECT
+        seller_id,
+        order_id,
+        SUM(price + freight_value) AS order_total
+    FROM all_items
+    WHERE order_status = 'delivered'
+    GROUP BY seller_id, order_id
+),
+
 -- ── Step 2: Deduplicate to order level for delivery metrics ───────────────────
 -- One row per seller × order to prevent multi-item orders inflating on_time_rate
 order_level_delivery AS (
@@ -69,52 +93,53 @@ order_level_delivery AS (
       AND order_estimated_delivery_date IS NOT NULL
 ),
 
--- ── Step 3: Delivered order metrics per seller ────────────────────────────────
+-- ── Step 3: Delivery timing metrics per seller (dates required, by design) ──
 delivered_metrics AS (
     SELECT
         seller_id,
-        COUNT(order_id)                         AS delivered_orders,
-        -- Revenue from item level (correct — items have price/freight)
-        (
-            SELECT ROUND(SUM(ai.price + ai.freight_value)::NUMERIC, 2)
-            FROM all_items ai
-            WHERE ai.seller_id = old.seller_id
-              AND ai.order_status = 'delivered'
-        )                                       AS total_revenue,
-        (
-            SELECT ROUND(AVG(ai.price + ai.freight_value)::NUMERIC, 2)
-            FROM all_items ai
-            WHERE ai.seller_id = old.seller_id
-              AND ai.order_status = 'delivered'
-        )                                       AS avg_order_value,
-        -- Delivery time: order level
         ROUND(AVG(
             DATE_PART('day',
                 order_delivered_customer_date - order_purchase_timestamp
             )
         )::NUMERIC, 1)                          AS avg_delivery_days,
-        -- On-time rate: order level (fixed)
         ROUND(
             SUM(CASE
                 WHEN order_delivered_customer_date <= order_estimated_delivery_date
                 THEN 1 ELSE 0
             END) * 100.0 / COUNT(order_id)
         , 2)                                    AS on_time_rate
-    FROM order_level_delivery old
+    FROM order_level_delivery
     GROUP BY seller_id
 ),
 
--- ── Step 4: Revenue at item level (correct grain for financials) ──────────────
-revenue_metrics AS (
+-- ── Step 4: Revenue at item level for totals, order level for the average ───
+revenue_item_totals AS (
     SELECT
         seller_id,
         ROUND(SUM(price + freight_value)::NUMERIC, 2)   AS total_revenue,
         ROUND(SUM(price)::NUMERIC, 2)                   AS total_product_revenue,
-        ROUND(SUM(freight_value)::NUMERIC, 2)           AS total_freight_revenue,
-        ROUND(AVG(price + freight_value)::NUMERIC, 2)   AS avg_item_value
+        ROUND(SUM(freight_value)::NUMERIC, 2)           AS total_freight_revenue
     FROM all_items
     WHERE order_status = 'delivered'
     GROUP BY seller_id
+),
+revenue_order_avg AS (
+    SELECT
+        seller_id,
+        ROUND(AVG(order_total)::NUMERIC, 2) AS avg_order_value
+    FROM order_level_revenue
+    GROUP BY seller_id
+),
+revenue_metrics AS (
+    SELECT
+        rit.seller_id,
+        rit.total_revenue,
+        rit.total_product_revenue,
+        rit.total_freight_revenue,
+        roa.avg_order_value
+    FROM revenue_item_totals rit
+    LEFT JOIN revenue_order_avg roa
+        ON rit.seller_id = roa.seller_id
 ),
 
 -- ── Step 5: Total order volume per seller (all statuses) ─────────────────────
@@ -124,33 +149,40 @@ total_volume AS (
         COUNT(DISTINCT order_id)    AS total_orders,
         COUNT(*)                    AS total_items_sold,
         ROUND(
-            SUM(CASE WHEN order_status = 'canceled' THEN 1 ELSE 0 END)
+            COUNT(DISTINCT CASE WHEN order_status = 'canceled' THEN order_id END)
             * 100.0 / COUNT(DISTINCT order_id)
         , 2)                        AS cancellation_rate
     FROM all_items
     GROUP BY seller_id
 ),
 
--- ── Step 6: Review metrics per seller ────────────────────────────────────────
+-- ── Step 6: Reviews deduplicated to order grain before joining (no fan-out) ─
+review_dedup AS (
+    SELECT order_id, AVG(review_score) AS order_review_score
+    FROM warehouse.fact_reviews
+    GROUP BY order_id
+),
+seller_order_pairs AS (
+    SELECT DISTINCT seller_id, order_id
+    FROM all_items
+),
 review_metrics AS (
     SELECT
-        s.seller_id,
-        COUNT(DISTINCT r.review_id)             AS total_reviews,
-        ROUND(AVG(r.review_score), 2)           AS avg_review_score,
+        sop.seller_id,
+        COUNT(DISTINCT sop.order_id) FILTER (WHERE rd.order_review_score IS NOT NULL) AS total_reviews,
+        ROUND(AVG(rd.order_review_score)::NUMERIC, 2)         AS avg_review_score,
         ROUND(
-            SUM(CASE WHEN r.review_score = 5 THEN 1 ELSE 0 END)
-            * 100.0 / COUNT(DISTINCT r.review_id)
-        , 2)                                    AS pct_5_star,
+            SUM(CASE WHEN rd.order_review_score = 5 THEN 1 ELSE 0 END) * 100.0
+            / NULLIF(COUNT(DISTINCT sop.order_id) FILTER (WHERE rd.order_review_score IS NOT NULL), 0)
+        , 2)                                                  AS pct_5_star,
         ROUND(
-            SUM(CASE WHEN r.review_score = 1 THEN 1 ELSE 0 END)
-            * 100.0 / COUNT(DISTINCT r.review_id)
-        , 2)                                    AS pct_1_star
-    FROM warehouse.fact_order_items i
-    JOIN warehouse.dim_seller s
-        ON i.seller_key = s.seller_key
-    JOIN warehouse.fact_reviews r
-        ON i.order_id = r.order_id
-    GROUP BY s.seller_id
+            SUM(CASE WHEN rd.order_review_score = 1 THEN 1 ELSE 0 END) * 100.0
+            / NULLIF(COUNT(DISTINCT sop.order_id) FILTER (WHERE rd.order_review_score IS NOT NULL), 0)
+        , 2)                                                  AS pct_1_star
+    FROM seller_order_pairs sop
+    LEFT JOIN review_dedup rd
+        ON sop.order_id = rd.order_id
+    GROUP BY sop.seller_id
 ),
 
 -- ── Step 7: Combine all metrics ───────────────────────────────────────────────
@@ -162,9 +194,9 @@ combined AS (
         COALESCE(tv.total_orders, 0)                            AS total_orders,
         COALESCE(tv.total_items_sold, 0)                        AS total_items_sold,
         COALESCE(tv.cancellation_rate, 0)                       AS cancellation_rate,
-        COALESCE(dm.delivered_orders, 0)                        AS delivered_orders,
+        COALESCE(tdo.delivered_orders, 0)                       AS delivered_orders,
         COALESCE(rm2.total_revenue, 0)                          AS total_revenue,
-        COALESCE(rm2.avg_item_value, 0)                         AS avg_order_value,
+        COALESCE(rm2.avg_order_value, 0)                        AS avg_order_value,
         COALESCE(rm2.total_product_revenue, 0)                  AS total_product_revenue,
         COALESCE(rm2.total_freight_revenue, 0)                  AS total_freight_revenue,
         COALESCE(dm.avg_delivery_days, 0)                       AS avg_delivery_days,
@@ -174,10 +206,11 @@ combined AS (
         COALESCE(rm.pct_5_star, 0)                              AS pct_5_star,
         COALESCE(rm.pct_1_star, 0)                              AS pct_1_star
     FROM warehouse.dim_seller s
-    LEFT JOIN total_volume tv       ON s.seller_id = tv.seller_id
-    LEFT JOIN delivered_metrics dm  ON s.seller_id = dm.seller_id
-    LEFT JOIN revenue_metrics rm2   ON s.seller_id = rm2.seller_id
-    LEFT JOIN review_metrics rm     ON s.seller_id = rm.seller_id
+    LEFT JOIN total_volume tv          ON s.seller_id = tv.seller_id
+    LEFT JOIN true_delivered_orders tdo ON s.seller_id = tdo.seller_id
+    LEFT JOIN delivered_metrics dm     ON s.seller_id = dm.seller_id
+    LEFT JOIN revenue_metrics rm2      ON s.seller_id = rm2.seller_id
+    LEFT JOIN review_metrics rm        ON s.seller_id = rm.seller_id
 ),
 
 -- ── Step 8: Revenue percentile (0-100) ───────────────────────────────────────
