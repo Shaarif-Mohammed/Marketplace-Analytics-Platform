@@ -19,22 +19,30 @@
 --   Response time : avg hours between review creation and answer timestamp
 --   Category      : avg score, % 1-star, % 5-star, total reviews
 --   Score band    : grouped positive/neutral/negative analysis
+--   Every dimension also reports reviews_with_comment/pct_with_comment and
+--   reviews_with_response/pct_with_response, computed identically across
+--   all four blocks — see AUDIT FIX note below.
 --
 -- Notes:
 --   • review_comment_title and review_comment_message are stored but not
 --     analysed here — NLP/sentiment reserved for future AI-layer project
 --   • Response time = review_answer_timestamp - review_creation_date
---   • Some reviews have no answer timestamp — excluded from response time calc
+--   • Some reviews have no answer timestamp — excluded from response time avg
 --   • review_id grain used (not order_id) to avoid fan-out from
 --     multi-item orders. COUNT(DISTINCT review_id) throughout.
 --   • ROUND() requires ::NUMERIC cast — DATE_PART returns double precision
 --     which is not supported by Postgres ROUND(double precision, integer)
+--   • When an order spans multiple product categories, the review is
+--     attributed to the category of that order's highest-value item
+--     (price + freight_value)
 -- =============================================================================
 
-CREATE OR REPLACE VIEW warehouse.vw_review_response_intelligence AS
+DROP VIEW IF EXISTS warehouse.vw_review_response_intelligence;
+
+CREATE VIEW warehouse.vw_review_response_intelligence AS
 
 WITH
--- ── Step 1: Base review data with category ────────────────────────────────────
+-- ── Step 1: Base review data with category and item value ────────────────────
 review_base AS (
     SELECT
         r.review_id,
@@ -62,7 +70,10 @@ review_base AS (
         CASE WHEN r.review_comment_message IS NOT NULL
             THEN TRUE ELSE FALSE
         END                                             AS has_comment,
-        COALESCE(p.product_category_name_english, 'uncategorised') AS category
+        COALESCE(p.product_category_name_english, 'uncategorised') AS category,
+        -- Item value, used only to pick the "primary" category when an
+        -- order spans multiple categories (see Step 2)
+        i.price + i.freight_value                       AS item_revenue
     FROM warehouse.fact_reviews r
     LEFT JOIN warehouse.fact_order_items i
         ON r.order_id = i.order_id
@@ -71,7 +82,9 @@ review_base AS (
 ),
 
 -- ── Step 2: Deduplicate reviews (one row per review_id) ───────────────────────
--- Multi-item orders can produce duplicate review rows after joining to items
+-- Multi-item orders can produce duplicate review rows after joining to items.
+-- Tie-break: keep the category of the order's highest-value item, not an
+-- arbitrary alphabetical pick.
 review_deduped AS (
     SELECT DISTINCT ON (review_id)
         review_id,
@@ -84,7 +97,7 @@ review_deduped AS (
         has_comment,
         category
     FROM review_base
-    ORDER BY review_id, category
+    ORDER BY review_id, item_revenue DESC NULLS LAST
 ),
 
 -- ── Step 3a: Score distribution ───────────────────────────────────────────────
@@ -110,6 +123,12 @@ score_distribution AS (
             SUM(CASE WHEN has_comment THEN 1 ELSE 0 END) * 100.0
             / COUNT(DISTINCT review_id)
         , 2)                                            AS pct_with_comment,
+        COUNT(CASE WHEN response_hours IS NOT NULL
+            THEN 1 END)                                 AS reviews_with_response,
+        ROUND(
+            COUNT(CASE WHEN response_hours IS NOT NULL THEN 1 END) * 100.0
+            / COUNT(DISTINCT review_id)
+        , 2)                                            AS pct_with_response,
         NULL::NUMERIC                                   AS avg_review_score,
         NULL::NUMERIC                                   AS pct_5_star,
         NULL::NUMERIC                                   AS pct_1_star
@@ -127,17 +146,21 @@ response_time AS (
         NULL::NUMERIC                                   AS pct_of_total,
         NULL::NUMERIC                                   AS cumulative_pct,
         ROUND(AVG(response_hours)::NUMERIC, 1)         AS avg_response_hours,
+        SUM(CASE WHEN has_comment THEN 1 ELSE 0 END)   AS reviews_with_comment,
+        ROUND(
+            SUM(CASE WHEN has_comment THEN 1 ELSE 0 END) * 100.0
+            / COUNT(DISTINCT review_id)
+        , 2)                                            AS pct_with_comment,
         COUNT(CASE WHEN response_hours IS NOT NULL
             THEN 1 END)                                 AS reviews_with_response,
         ROUND(
-            COUNT(CASE WHEN response_hours IS NOT NULL THEN 1 END)
-            * 100.0 / COUNT(DISTINCT review_id)
-        , 2)                                            AS pct_with_comment,
+            COUNT(CASE WHEN response_hours IS NOT NULL THEN 1 END) * 100.0
+            / COUNT(DISTINCT review_id)
+        , 2)                                            AS pct_with_response,
         NULL::NUMERIC                                   AS avg_review_score,
         NULL::NUMERIC                                   AS pct_5_star,
         NULL::NUMERIC                                   AS pct_1_star
     FROM review_deduped
-    WHERE response_hours IS NOT NULL
     GROUP BY review_score
 ),
 
@@ -159,6 +182,12 @@ score_band_summary AS (
             SUM(CASE WHEN has_comment THEN 1 ELSE 0 END) * 100.0
             / COUNT(DISTINCT review_id)
         , 2)                                            AS pct_with_comment,
+        COUNT(CASE WHEN response_hours IS NOT NULL
+            THEN 1 END)                                 AS reviews_with_response,
+        ROUND(
+            COUNT(CASE WHEN response_hours IS NOT NULL THEN 1 END) * 100.0
+            / COUNT(DISTINCT review_id)
+        , 2)                                            AS pct_with_response,
         ROUND(AVG(review_score::NUMERIC), 2)           AS avg_review_score,
         NULL::NUMERIC                                   AS pct_5_star,
         NULL::NUMERIC                                   AS pct_1_star
@@ -181,6 +210,12 @@ by_category AS (
             SUM(CASE WHEN has_comment THEN 1 ELSE 0 END) * 100.0
             / COUNT(DISTINCT review_id)
         , 2)                                            AS pct_with_comment,
+        COUNT(CASE WHEN response_hours IS NOT NULL
+            THEN 1 END)                                 AS reviews_with_response,
+        ROUND(
+            COUNT(CASE WHEN response_hours IS NOT NULL THEN 1 END) * 100.0
+            / COUNT(DISTINCT review_id)
+        , 2)                                            AS pct_with_response,
         ROUND(AVG(review_score::NUMERIC), 2)           AS avg_review_score,
         ROUND(
             SUM(CASE WHEN review_score = 5 THEN 1 ELSE 0 END) * 100.0

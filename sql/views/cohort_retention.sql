@@ -20,7 +20,9 @@
 --     a Brazilian marketplace in growth phase.
 -- =============================================================================
 
-CREATE OR REPLACE VIEW warehouse.vw_retention AS
+DROP VIEW IF EXISTS warehouse.vw_retention;
+
+CREATE VIEW warehouse.vw_retention AS
 
 WITH
 -- ── Step 1: All delivered orders with customer and order month ────────────────
@@ -78,22 +80,45 @@ retention_counts AS (
     GROUP BY cohort_month, period_number
 )
 
--- ── Final output ──────────────────────────────────────────────────────────────
+,
+-- ── Step 6: Complete cohort × period grid (fills zero-retention gaps) ───────
+-- Right-censoring preserved: only generates periods up to the dataset's last
+-- observed order month, same window the original view was implicitly limited to.
+dataset_bounds AS (
+    SELECT MAX(order_month) AS last_order_month FROM delivered_orders
+),
+period_grid AS (
+    SELECT
+        cs.cohort_month,
+        gs.period_number
+    FROM cohort_sizes cs
+    CROSS JOIN dataset_bounds db
+    CROSS JOIN LATERAL generate_series(
+        0,
+        ((DATE_PART('year', db.last_order_month) - DATE_PART('year', cs.cohort_month)) * 12
+        + (DATE_PART('month', db.last_order_month) - DATE_PART('month', cs.cohort_month)))::INTEGER
+    ) AS gs(period_number)
+)
+
+-- ── Final output: complete grid, zero-filled where no customers returned ─────
 SELECT
-    r.cohort_month,
+    g.cohort_month,
     cs.cohort_size,
-    r.period_number,
-    r.retained_customers,
-    -- Retention rate as percentage of cohort size
+    g.period_number,
+    COALESCE(r.retained_customers, 0) AS retained_customers,
     ROUND(
-        r.retained_customers * 100.0 / cs.cohort_size
+        COALESCE(r.retained_customers, 0) * 100.0 / cs.cohort_size
     , 2) AS retention_rate_pct,
-    -- Absolute churn from previous period (NULL for period 0)
-    LAG(r.retained_customers) OVER (
-        PARTITION BY r.cohort_month
-        ORDER BY r.period_number
-    ) - r.retained_customers AS churned_from_prev_period
-FROM retention_counts r
+    LAG(COALESCE(r.retained_customers, 0)) OVER (
+        PARTITION BY g.cohort_month
+        ORDER BY g.period_number
+    ) - COALESCE(r.retained_customers, 0) AS churned_from_prev_period
+FROM period_grid g
 JOIN cohort_sizes cs
-    ON r.cohort_month = cs.cohort_month
-ORDER BY r.cohort_month, r.period_number;
+    ON g.cohort_month = cs.cohort_month
+LEFT JOIN retention_counts r
+    ON g.cohort_month = r.cohort_month
+    AND g.period_number = r.period_number
+ORDER BY g.cohort_month, g.period_number;
+
+

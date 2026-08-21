@@ -10,7 +10,9 @@
 --              This view pivots new/returning into separate columns for
 --              easier charting and calculated field creation in Tableau.
 --
--- Grain: One row per order_month.
+-- Grain: One row per order_month, covering EVERY calendar month in the
+--        dataset's range (zero-filled where a month had no orders — see
+--        AUDIT FIX), not just months with activity.
 --
 -- Definitions:
 --   New customer      : first ever delivered order in that month
@@ -25,6 +27,11 @@
 --   • Based on delivered orders only
 --   • customer_unique_id grain (true person, not order-scoped customer_id)
 --   • Reference date consistent with vw_rfm and vw_clv (2018-09-01)
+--   • new_avg_order_value / returning_avg_order_value use
+--     SUM(order_value) / COUNT(DISTINCT order_id) rather than AVG() over
+--     item-level rows — verified correct, no item-vs-order grain issue
+--     here.
+--
 -- =============================================================================
 
 CREATE OR REPLACE VIEW warehouse.vw_new_vs_returning_revenue AS
@@ -70,30 +77,57 @@ order_tagged AS (
         ON d.customer_unique_id = f.customer_unique_id
 ),
 
--- ── Step 4: Pivot to wide format — one row per month ─────────────────────────
-monthly_pivot AS (
+-- ── Step 4: Aggregate by month (only months with activity) ──────────────────
+monthly_agg AS (
     SELECT
         order_month,
-        -- New customer metrics
         COUNT(DISTINCT CASE WHEN customer_type = 'new'
             THEN customer_unique_id END)                        AS new_customers,
         COUNT(DISTINCT CASE WHEN customer_type = 'new'
             THEN order_id END)                                  AS new_orders,
         ROUND(COALESCE(SUM(CASE WHEN customer_type = 'new'
             THEN order_value END), 0)::NUMERIC, 2)             AS new_revenue,
-        -- Returning customer metrics
         COUNT(DISTINCT CASE WHEN customer_type = 'returning'
             THEN customer_unique_id END)                        AS returning_customers,
         COUNT(DISTINCT CASE WHEN customer_type = 'returning'
             THEN order_id END)                                  AS returning_orders,
         ROUND(COALESCE(SUM(CASE WHEN customer_type = 'returning'
             THEN order_value END), 0)::NUMERIC, 2)             AS returning_revenue,
-        -- Totals
         COUNT(DISTINCT customer_unique_id)                      AS total_customers,
         COUNT(DISTINCT order_id)                                AS total_orders,
         ROUND(SUM(order_value)::NUMERIC, 2)                    AS total_revenue
     FROM order_tagged
     GROUP BY order_month
+),
+
+-- ── Step 4b: Complete month grid, zero-filled ────────────────────────────────
+-- Prevents LAG() and the rolling average from silently comparing
+-- non-adjacent calendar months when a month had zero delivered orders
+-- (e.g. Nov 2016, a genuine zero-order month in the underlying dataset).
+month_bounds AS (
+    SELECT MIN(order_month) AS min_month, MAX(order_month) AS max_month
+    FROM delivered_orders
+),
+month_grid AS (
+    SELECT gs.month_start::DATE AS order_month
+    FROM month_bounds mb
+    CROSS JOIN LATERAL generate_series(mb.min_month, mb.max_month, INTERVAL '1 month') AS gs(month_start)
+),
+monthly_pivot AS (
+    SELECT
+        mg.order_month,
+        COALESCE(ma.new_customers, 0)          AS new_customers,
+        COALESCE(ma.new_orders, 0)             AS new_orders,
+        COALESCE(ma.new_revenue, 0)            AS new_revenue,
+        COALESCE(ma.returning_customers, 0)    AS returning_customers,
+        COALESCE(ma.returning_orders, 0)       AS returning_orders,
+        COALESCE(ma.returning_revenue, 0)      AS returning_revenue,
+        COALESCE(ma.total_customers, 0)        AS total_customers,
+        COALESCE(ma.total_orders, 0)           AS total_orders,
+        COALESCE(ma.total_revenue, 0)          AS total_revenue
+    FROM month_grid mg
+    LEFT JOIN monthly_agg ma
+        ON mg.order_month = ma.order_month
 )
 
 -- ── Final output ──────────────────────────────────────────────────────────────
@@ -119,19 +153,20 @@ SELECT
     ROUND(returning_revenue / NULLIF(returning_orders, 0), 2)      AS returning_avg_order_value,
     -- Revenue per new customer acquired (acquisition efficiency proxy)
     ROUND(new_revenue / NULLIF(new_customers, 0), 2)               AS revenue_per_new_customer,
-    -- MoM change in returning revenue (key retention growth metric)
+    -- MoM change in returning revenue (now against a true adjacent month)
     LAG(returning_revenue) OVER (ORDER BY order_month)             AS prev_month_returning_revenue,
     ROUND(
         (returning_revenue - LAG(returning_revenue) OVER (ORDER BY order_month))
         * 100.0 / NULLIF(LAG(returning_revenue) OVER (ORDER BY order_month), 0)
     , 2)                                                            AS returning_revenue_mom_growth_pct,
-    -- MoM change in total revenue
+    -- MoM change in total revenue (now against a true adjacent month)
     LAG(total_revenue) OVER (ORDER BY order_month)                 AS prev_month_total_revenue,
     ROUND(
         (total_revenue - LAG(total_revenue) OVER (ORDER BY order_month))
         * 100.0 / NULLIF(LAG(total_revenue) OVER (ORDER BY order_month), 0)
     , 2)                                                            AS total_revenue_mom_growth_pct,
-    -- Cumulative returning revenue share trend (3-month rolling avg to smooth noise)
+    -- Cumulative returning revenue share trend (3-CALENDAR-month rolling avg,
+    -- now safe across the zero-filled grid)
     ROUND(AVG(returning_revenue * 100.0 / NULLIF(total_revenue, 0))
         OVER (ORDER BY order_month ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
     , 2)                                                            AS returning_pct_3m_rolling_avg
